@@ -17,6 +17,7 @@ En este proyecto analizaremos datos de secuenciación de _Escherichia coli_ obte
 │ └── fastp/
 ├── assembly_results/ # scaffold.fasta + reporte QUAST
 ├── index/            # Archivos BAM procesados e indexados
+├── VCF/              # Archivos VCF anotados y filtrados + reportes SnpEff
 ├── informe/          # Informe PDF con análisis biológico
 └── README.md         # Este archivo
 ```
@@ -43,6 +44,9 @@ Este repositorio contiene un conjunto de scripts bash que implementan un pipelin
 | `03_trimming.sh` | Aplica **fastp** para trimming y filtrado por calidad.                             |
 | `04_post_qc.sh` | Ejecuta **FastQC** y **MultiQC** sobre las lecturas depuradas por calidad.                            |
 | `05_assemble_mapping.sh` | Ensamblaje de novo con **SPAdes** y evaluación con **Quast** y alineamiento de lecturas evolucionadas con **BWA** + procesamiento con `samtools`. |
+| `06_variant_calling.sh` | Llamado de variantes con **bcftools** para identificar SNPs e indels entre el genoma ancestral y las líneas evolucionadas. |
+| `07_prokka.sh` | Anotación funcional del genoma de referencia con **Prokka** para identificar genes, productos y funciones. |
+| `08_snpeff.sh` | Anotación y predicción del impacto funcional de variantes con **SnpEff** y filtrado de variantes relevantes con **SnpSift**. |
 
 # Explicación de códigos y flags importantes
 
@@ -126,3 +130,115 @@ rm -rf mapping/trash*
 
 - `rm -rf mapping/trash*`  
   Elimina archivos temporales generados en el proceso.
+
+  ## Variant Calling (06_VCF.sh)
+
+**bcftools mpileup + call:**
+```bash
+bcftools mpileup -Ou --redo-BAQ --fasta-ref assemble/filter_scaffold_anc_trimmed.fasta \
+  --ploidy 1 --min-MQ 20 \
+  mapping/filtered_aligned_trimmed_evol1.bam mapping/filtered_aligned_trimmed_evol2.bam \
+  | bcftools call -mv -Ov \
+  | bcftools filter -Ov --include 'QUAL>35 && DP>25' > VCF/evol1_evol2.vcf
+```
+- `--redo-BAQ`: Recalcula la calidad de bases para disminuir falsos positivos causados por errores de alineamiento cerca de indels.
+- `--min-MQ 20`: Filtra bases con calidad de mapeo menor a 20.
+- `--ploidy 1`: Especifica que el genoma es haploide (bacterias).
+- `-Ou`: Salida en formato binario no comprimido, optimizado para pipelines.
+- `-mv`: Usa el método de llamado de variantes multialélico (`m`) y solo incluye sitios variantes (`v`).
+- `-Ov`: Salida en formato VCF estándar (texto).
+- `--include 'QUAL>35 && DP>25'`: Retiene solo variantes con calidad > 35 y profundidad de cobertura > 25x, asegurando alta confiabilidad.
+
+**Nota:** La calidad (`QUAL`) se refiere a la confianza estadística de la variante, no a la calidad de la base.
+
+## Anotación Funcional con Prokka (07_prokka.sh )
+
+**Prokka** anota genomas bacterianos prediciendo genes, tRNAs, rRNAs y asignando funciones basadas en bases de datos.
+```bash
+prokka --prefix anc_genome \
+  --genus Escherichia \
+  --species coli \
+  --usegenus \
+  --addgenes \
+  --kingdom bacteria \
+  --force \
+  assemble/filter_scaffold_anc_trimmed.fasta \
+  --outdir VCF/anotation_anc
+
+- `--prefix anc_genome`: Nombre base para todos los archivos de salida.
+- `--genus Escherichia --species coli`: Especifica el organismo para búsquedas en bases de datos específicas.
+- `--usegenus`: Usa bases de datos específicas del género para mejorar anotación.
+- `--addgenes`: Añade nombres de genes cuando sea posible.
+- `--kingdom bacteria`: Especifica que es un genoma bacteriano.
+- `--force`: Sobrescribe el directorio de salida si ya existe.
+
+## Anotación y Filtrado de Variantes con SnpEff (08_snpeff.sh)
+
+### Configuración de Base de Datos SnpEff
+
+**SnpEff** requiere una base de datos personalizada del genoma de referencia para anotar el impacto funcional de las variantes.
+
+**Pasos de configuración:**
+
+1. **Editar `snpEff.config`**: Se añade una entrada para el genoma personalizado.
+```bash
+DB_ENTRY="anc_genome.genome : Simon_ecoli"
+grep -qxF "$DB_ENTRY" "$CONFIG_PATH" || echo "$DB_ENTRY" >> "$CONFIG_PATH"
+```
+
+2. **Crear estructura de directorios**: SnpEff requiere que los archivos estén en `data/anc_genome/`.
+```bash
+mkdir -p "$(dirname "$CONFIG_PATH")/data/anc_genome"
+cp assemble/filter_scaffold_anc_trimmed.fasta "$(dirname "$CONFIG_PATH")/data/anc_genome/sequences.fa"
+cp VCF/anotation_anc/anc_genome.gff "$(dirname "$CONFIG_PATH")/data/anc_genome/genes.gff"
+```
+
+3. **Construir la base de datos**:
+```bash
+java -jar "$JAR_PATH" build -gff3 -v anc_genome
+```
+
+- `-gff3`: Indica que el archivo de anotación está en formato GFF3.
+- `-v`: Modo verbose (muestra detalles del proceso).
+
+### Anotación de Variantes
+```bash
+java -jar "$JAR_PATH" -v \
+  -stats VCF/snpEff_stats_evol1.html \
+  anc_genome \
+  VCF/evol1.vcf \
+  > VCF/annotated_evol1.vcf
+```
+
+- `-stats`: Genera un reporte HTML con estadísticas de las variantes anotadas (distribución por tipo, impacto, genes afectados).
+- `anc_genome`: Nombre de la base de datos personalizada creada.
+- Salida: VCF anotado con información en el campo `ANN` (efecto, gen, cambio aminoacídico, impacto).
+
+**Clasificación de impacto de SnpEff:**
+- **HIGH**: Pérdida o ganancia de función (frameshifts, stop gained/lost, start lost).
+- **MODERATE**: Cambios no-sinónimos (missense).
+- **LOW**: Cambios sinónimos.
+- **MODIFIER**: Variantes intergénicas o intrón.
+
+### Filtrado con SnpSift
+
+**SnpSift** filtra variantes según criterios específicos del campo `ANN`.
+```bash
+java -jar "$SNPSIFT_PATH" filter --inverse \
+  "(ANN[*].EFFECT has 'downstream_gene_variant') || \
+   (ANN[*].EFFECT has 'upstream_gene_variant') || \
+   (ANN[*].EFFECT has 'synonymous_variant') || \
+   (ANN[*].EFFECT has 'splice_region_variant')" \
+  VCF/annotated_evol1.vcf \
+  > VCF/filtered_annotated_evol1.vcf
+```
+
+**Criterios de filtrado aplicados:**
+
+- `--inverse`: Excluye (en lugar de incluir) las variantes que cumplan los criterios.
+
+**Variantes excluidas:**
+1. **downstream_gene_variant**: Variantes > 5000 pb después del final del gen (poco probable que afecten función).
+2. **upstream_gene_variant**: Variantes > 5000 pb antes del inicio del gen.
+3. **synonymous_variant**: Mutaciones silenciosas que no cambian el aminoácido.
+4. **splice_region_variant**: Variantes en regiones de splicing (no aplica a E. coli, que no hace splicing).
