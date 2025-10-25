@@ -17,6 +17,7 @@ En este proyecto analizaremos datos de secuenciación de _Escherichia coli_ obte
 │ └── fastp/
 ├── assembly_results/ # scaffold.fasta + reporte QUAST
 ├── index/            # Archivos BAM procesados e indexados
+├── taxonomic/        # Clasificación taxonómica de lecturas no mapeadas + gráficos Krona
 ├── VCF/              # Archivos VCF anotados y filtrados + reportes SnpEff
 ├── informe/          # Informe PDF con análisis biológico
 └── README.md         # Este archivo
@@ -44,13 +45,14 @@ Este repositorio contiene un conjunto de scripts bash que implementan un pipelin
 | `03_trimming.sh` | Aplica **fastp** para trimming y filtrado por calidad.                             |
 | `04_post_qc.sh` | Ejecuta **FastQC** y **MultiQC** sobre las lecturas depuradas por calidad.                            |
 | `05_assemble_mapping.sh` | Ensamblaje de novo con **SPAdes** y evaluación con **Quast** y alineamiento de lecturas evolucionadas con **BWA** + procesamiento con `samtools`. |
-| `06_variant_calling.sh` | Llamado de variantes con **bcftools** para identificar SNPs e indels entre el genoma ancestral y las líneas evolucionadas. |
-| `07_prokka.sh` | Anotación funcional del genoma de referencia con **Prokka** para identificar genes, productos y funciones. |
-| `08_snpeff.sh` | Anotación y predicción del impacto funcional de variantes con **SnpEff** y filtrado de variantes relevantes con **SnpSift**. |
+| `06_taxonomic.sh` | Clasificación taxonómica de lecturas no mapeadas con **Kraken2** y visualización con **Krona** para detectar contaminantes. |
+| `07_VCF.sh` | Llamado de variantes con **bcftools** para identificar SNPs e indels entre el genoma ancestral y las líneas evolucionadas. |
+| `08_prokka.sh` | Anotación funcional del genoma de referencia con **Prokka** para identificar genes, productos y funciones. |
+| `09_snpeff.sh` | Anotación y predicción del impacto funcional de variantes con **SnpEff** y filtrado de variantes relevantes con **SnpSift**. |
 
 # Explicación de códigos y flags importantes
 
-## trimming_02
+## trimming_03
 
 **fastp** comando que realiza el control de calidad para datos de secuenciación.
 
@@ -131,7 +133,58 @@ rm -rf mapping/trash*
 - `rm -rf mapping/trash*`  
   Elimina archivos temporales generados en el proceso.
 
-  ## Variant Calling (06_VCF.sh)
+  ## Clasificación Taxonómica de Lecturas No Mapeadas (06_Taxonomic.sh)
+
+Este paso analiza las lecturas que **no mapearon** contra el genoma de referencia ancestral para identificar posibles contaminantes o ADN extracromosómico (plásmidos, fagos, contaminación ambiental).
+
+### Extracción de Lecturas No Mapeadas
+
+**Samtools sort y fastq:**
+```bashsamtools sort -n mapping/unmapped_reads/unmapped_evol1.bam -o mapping/unmapped_reads/sorted_unmapped_evol1.bamsamtools fastq -1 taxonomic/unmapped_evol1_R1.fastq 
+-2 taxonomic/unmapped_evol1_R2.fastq 
+mapping/unmapped_reads/sorted_unmapped_evol1.bam
+
+- `sort -n`: Ordena el BAM **por nombre de lectura** (no por coordenadas genómicas), necesario para paired-end porque `samtools fastq` requiere que los pares R1/R2 estén contiguos para reconstruir correctamente las lecturas pareadas.
+- `fastq -1 -2`: Convierte el archivo BAM en dos archivos FASTQ separados (R1 y R2).
+
+### Base de Datos Kraken2
+
+**Kraken2** es una herramienta ultrarrápida de clasificación taxonómica que compara k-mers de las lecturas contra una base de datos de genomas conocidos.
+
+**Descarga de base de datos:**
+```bash
+wget https://genome-idx.s3.amazonaws.com/kraken/k2_standard_16_GB_20250714.tar.gz
+tar -xvzf k2_standard_16_GB_20250714.tar.gz -C db_kraken2
+```
+
+- **k2_standard_16_GB**: Base de datos reducida (~16 GB) que contiene genomas de:
+  - Bacterias (RefSeq completo)
+  - Arqueas
+  - Virus
+  - Plásmidos
+  - Genoma humano (para detectar contaminación del operador)
+
+**Actualización de taxonomía:**
+```bash
+updateTaxonomy.sh
+```
+
+### Visualización con Krona
+
+**Krona** genera gráficos HTML interactivos tipo "sunburst" (sol) que muestran la composición taxonómica jerárquica.
+```bash
+ktImportTaxonomy -t 5 -m 3 \
+  -o taxonomic/krona_evol1.html \
+  taxonomic/kraken_report_evol1.txt
+```
+
+**Flags:**
+
+- `-t 5`: Columna del archivo de entrada que contiene el TaxID (columna 5 del reporte de Kraken2).
+- `-m 3`: Columna con la magnitud/abundancia (número de lecturas, columna 3).
+- `-o`: Archivo HTML de salida con gráfico interactivo.
+
+  ## Variant Calling (07_VCF.sh)
 
 **bcftools mpileup + call:**
 ```bash
@@ -151,7 +204,7 @@ bcftools mpileup -Ou --redo-BAQ --fasta-ref assemble/filter_scaffold_anc_trimmed
 
 **Nota:** La calidad (`QUAL`) se refiere a la confianza estadística de la variante, no a la calidad de la base.
 
-## Anotación Funcional con Prokka (07_prokka.sh )
+## Anotación Funcional con Prokka (08_prokka.sh )
 
 **Prokka** anota genomas bacterianos prediciendo genes, tRNAs, rRNAs y asignando funciones basadas en bases de datos.
 ```bash
@@ -172,7 +225,7 @@ prokka --prefix anc_genome \
 - `--kingdom bacteria`: Especifica que es un genoma bacteriano.
 - `--force`: Sobrescribe el directorio de salida si ya existe.
 
-## Anotación y Filtrado de Variantes con SnpEff (08_snpeff.sh)
+## Anotación y Filtrado de Variantes con SnpEff (09_snpeff.sh)
 
 ### Configuración de Base de Datos SnpEff
 
